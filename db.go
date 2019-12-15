@@ -11,8 +11,3 @@ type meta struct {
 	txid     txid
 	checksum uint64
 }
-
-type bucket struct {
-	root     pgid
-	sequence uint64
-}
