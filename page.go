@@ -51,7 +51,7 @@ func (p *page) meta() *meta {
 	return (*meta)(unsafe.Pointer(&p.ptr))
 }
 
-func (p *page) leafPageElement(index uint64) *leafPageElement {
+func (p *page) leafPageElement(index uint16) *leafPageElement {
 	n := &((*[0x7FFFFFF]leafPageElement)(unsafe.Pointer(&p.ptr)))[index]
 	return n
 }
