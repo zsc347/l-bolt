@@ -176,3 +176,33 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 
 	return &child
 }
+
+// node creates a node from a page and associates it with a given parent.
+func (b *Bucket) node(pgid pgid, parent *node) *node {
+	// TODO
+	return nil
+}
+
+// write allocates and writes a bucket to a byte slice
+func (b *Bucket) write() []byte {
+	// TODO
+	return nil
+	// Allocate the appropriate size
+}
+
+// CreateBucket creates a new bucket at the given key and returns the new bucket.
+// Returns an error if the key already exists, if the bucker name is blank,
+// or if the bucket name is too long.
+// The bucket instance is only valid for the lifetime of the transaction.
+func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
+	if b.tx.db == nil {
+		return nil, ErrTxClosed
+	} else if !b.tx.writable {
+		return nil, ErrTxNotWritable
+	} else if len(key) == 0 {
+		return nil, ErrBucketNameRequied
+	}
+
+	// TODO
+	return nil, nil
+}

@@ -17,6 +17,7 @@ type txid uint64
 type Tx struct {
 	writable bool
 	db       *DB
+	meta     *meta
 	pages    map[pgid]*page
 	stats    TxStats
 }
