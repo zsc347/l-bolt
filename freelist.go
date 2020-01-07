@@ -6,6 +6,9 @@ import (
 	"unsafe"
 )
 
+// freelist represents a list of all pages that are available for allocation.
+// It also tracks pages that have been freed but are still in use by open
+// transactions.
 type freelist struct {
 	ids     []pgid
 	pending map[txid][]pgid

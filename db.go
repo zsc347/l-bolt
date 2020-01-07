@@ -4,6 +4,8 @@ import "fmt"
 
 import "unsafe"
 
+import "os"
+
 // DB represents a collection of buckets persisted to a file on disk.
 // All data access is performed through transactions which can be obtained
 // through the DB.
@@ -12,12 +14,20 @@ import "unsafe"
 type DB struct {
 	pageSize int
 	data     *[maxMapSize]byte
+
+	freelist *freelist
 }
 
 // page retrieves a page reference from the mmap based on the current page size
 func (db *DB) page(id pgid) *page {
 	pos := id * pgid(db.pageSize)
 	return (*page)(unsafe.Pointer(&db.data[pos]))
+}
+
+// allocate returns a contiguous block of memory starting at a given page.
+func (db *DB) allocate(count int) (*page, error) {
+	// TODO
+	return nil, nil
 }
 
 type meta struct {
@@ -37,4 +47,12 @@ func _assert(condition bool, msg string, v ...interface{}) {
 	if !condition {
 		panic(fmt.Sprintf("assertion failed: "+msg, v...))
 	}
+}
+
+func warn(v ...interface{}) {
+	fmt.Fprintln(os.Stderr, v...)
+}
+
+func warnf(msg string, v ...interface{}) {
+	fmt.Fprintf(os.Stderr, msg+"\n", v...)
 }
