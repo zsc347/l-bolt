@@ -185,9 +185,19 @@ func (b *Bucket) node(pgid pgid, parent *node) *node {
 
 // write allocates and writes a bucket to a byte slice
 func (b *Bucket) write() []byte {
-	// TODO
-	return nil
-	// Allocate the appropriate size
+	// Allocate the appropriate size.
+	var n = b.rootNode
+	var value = make([]byte, bucketHeaderSize+n.size())
+
+	// Write a bucket header.
+	var bucket = (*bucket)(unsafe.Pointer(&value[0]))
+	*bucket = *b.bucket
+
+	// Convert byte slice to a fake page and write the root node.
+	var p = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
+	n.write(p)
+
+	return value
 }
 
 // CreateBucket creates a new bucket at the given key and returns the new bucket.
@@ -203,6 +213,89 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 		return nil, ErrBucketNameRequied
 	}
 
+	// Move cursor to correct position.
+	c := b.Cursor()
+	k, _, flags := c.seek(key)
+
+	// Return an error if there is an existing key.
+	if bytes.Equal(key, k) {
+		if (flags & bucketLeafFlag) != 0 {
+			return nil, ErrBucketExists
+		}
+		return nil, ErrIncompatibleValue
+	}
+
+	// Create empty, inline bucket.
+	var bucket = Bucket{
+		bucket:      &bucket{},
+		rootNode:    &node{isLeaf: true},
+		FillPercent: DefaultFillPercent,
+	}
+	var value = bucket.write()
+
+	// Insert into node.
+	key = cloneBytes(key)
+	c.node().put(key, key, value, 0, bucketLeafFlag)
+
+	// Since sub buckets are not allowed on inline buckets, we need to
+	// dereference the inline page, if it exists.
+	// This will cause the bucket to be treated as a regular,
+	// non-inline bucket bucket for the rest of the tx.
+	b.page = nil
+
+	return b.Bucket(key), nil
+}
+
+// CreateBucketIfNotExists creates a new bucket if it doesn't already
+// exist and returns a reference to it.
+// Returns an error if the bucket name is blank, or if the bucket name is too long.
+// The bucket instance is only valid for the lifetime of the transaction.
+func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
+	child, err := b.CreateBucket(key)
+	if err == ErrBucketExists {
+		return b.Bucket(key), nil
+	} else if err != nil {
+		return nil, err
+	}
+	return child, nil
+}
+
+// DeleteBucket deletes a bucket at a given key.
+// Returns an error if the bucket does not exists,
+// or if the key represents a non-bucket value.
+func (b *Bucket) DeleteBucket(key []byte) error {
+	if b.tx.db == nil {
+		return ErrTxClosed
+	} else if !b.Writable() {
+		return ErrTxNotWritable
+	}
+
+	// Move Cursor to correct position.
+	c := b.Cursor()
+	k, _, flags := c.seek(key)
+
+	// Return an error if bucket doesn't exist or is not a bucket
+	if !bytes.Equal(key, k) {
+		return ErrBucketNotFound
+	} else if (flags & bucketLeafFlag) == 0 {
+		return ErrIncompatibleValue
+	}
+
 	// TODO
-	return nil, nil
+
+	return nil
+}
+
+// ForEach executes a function for each key/value pair in a bucket.
+// If the provided function returns an error then the iteration is stopped
+// and the error is returned to the caller.
+// The provided function must not modify the bucket
+// this will result in undefined behavior
+func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
+	if b.tx.db == nil {
+		return ErrTxClosed
+	}
+
+	c := b.Cursor()
+	for k, v := c.Fir
 }

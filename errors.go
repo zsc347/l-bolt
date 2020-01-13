@@ -19,6 +19,10 @@ var (
 
 // These errors can occur when putting or deleting a value or a bucket
 var (
+	// ErrBucketNotFound is returned when trying to access a bucket that
+	// has not been created yet.
+	ErrBucketNotFound = errors.New("bucket not found")
+
 	// ErrBucketExists is returned when creating a bucket that already exists.
 	ErrBucketExists = errors.New("bucket already exists")
 
