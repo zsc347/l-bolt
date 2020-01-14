@@ -29,6 +29,15 @@ var (
 	// ErrBucketNameRequired  is returned when creating a bucket with a blank name
 	ErrBucketNameRequied = errors.New("bucket name required")
 
+	// ErrKeyRequired is returned when inserting a zero-length key.
+	ErrKeyRequired = errors.New("key required")
+
+	// ErrKeyTooLarge is returned when inserting a key that is larger than MaxKeySize.
+	ErrKeyTooLarge = errors.New("key too large")
+
+	// ErrValueTooLarge is returned when inserting a value that is larger than MaxValueSize.
+	ErrValueTooLarge = errors.New("value too large")
+
 	// ErrIncompatibleValue is returned when trying create or delete
 	// a bucket on an existing non-bucket or when trying to create a
 	// delete a non-bucket key on an existing bucket key.

@@ -36,6 +36,22 @@ func (tx *Tx) page(id pgid) *page {
 	return tx.db.page(id)
 }
 
+// forEachPage iterates over every page within a given page and executes a function.
+func (tx *Tx) forEachPage(pgid pgid, depth int, fn func(*page, int)) {
+	p := tx.page(pgid)
+
+	// Execute function.
+	fn(p, depth)
+
+	// Recursively loop over children.
+	if (p.flags & branchPageFlag) != 0 {
+		for i := 0; i < int(p.count); i++ {
+			elem := p.branchPageElement(uint16(i))
+			tx.forEachPage(elem.pgid, depth+1, fn)
+		}
+	}
+}
+
 // allocate returns a contiguous block of memory starting at a given page.
 func (tx *Tx) allocate(count int) (*page, error) {
 	p, err := tx.db.allocate(count)
