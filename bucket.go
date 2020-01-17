@@ -35,17 +35,29 @@ const DefaultFillPercent = 0.5
 // Bucket represents a collection of key/value pairs inside the database.
 type Bucket struct {
 	*bucket
-	tx          *Tx                // the associated transaction
-	buckets     map[string]*Bucket // subbucker cache
-	page        *page              // inline page reference
-	rootNode    *node              // materialized note for the root page
-	nodes       map[pgid]*node     // node cache
+	tx       *Tx                // the associated transaction
+	buckets  map[string]*Bucket // subbucket cache
+	page     *page              // inline page reference
+	rootNode *node              // materialized note for the root page
+	nodes    map[pgid]*node     // node cache
+
+	// Sets the threshold for filling nodes when they split.
+	// By default, the bucket will fill to 50% but it can be useful to
+	// increase this amount if you know that your write workloads are mostly
+	// append-only.
+	//
+	// This is non-persisted across transactions so it must be set in every Tx.
 	FillPercent float64
 }
 
+// bucket represents the on-file representation of a bucket.
+// This is stored as the "value" of a bucket key.
+// If the bucket is small enough, then its root page can be stored inline in
+// the "value", after the bucket header. In the case of inline buckets, the
+// "root" will be 0
 type bucket struct {
-	root     pgid
-	sequence uint64
+	root     pgid   // page id of the bucket's root-level page
+	sequence uint64 // monotonically incrementing, used by NextSequence()
 }
 
 // newBucket returns a new bucker associated with a transaction.
@@ -113,13 +125,6 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 	return child
 }
 
-// cloneBytes returns a copy of a given slice
-func cloneBytes(v []byte) []byte {
-	var clone = make([]byte, len(v))
-	copy(clone, v)
-	return clone
-}
-
 // Helper method that re-interprets a sub-bucket value
 // from a parent into a Bucket
 func (b *Bucket) openBucket(value []byte) *Bucket {
@@ -148,23 +153,6 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 	}
 
 	return &child
-}
-
-// write allocates and writes a bucket to a byte slice
-func (b *Bucket) write() []byte {
-	// Allocate the appropriate size.
-	var n = b.rootNode
-	var value = make([]byte, bucketHeaderSize+n.size())
-
-	// Write a bucket header.
-	var bucket = (*bucket)(unsafe.Pointer(&value[0]))
-	*bucket = *b.bucket
-
-	// Convert byte slice to a fake page and write the root node.
-	var p = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
-	n.write(p)
-
-	return value
 }
 
 // CreateBucket creates a new bucket at the given key and returns the new bucket.
@@ -396,6 +384,92 @@ func (b *Bucket) NextSequence() (uint64, error) {
 	return b.bucket.sequence, nil
 }
 
+// Stats returns stats on a bucket.
+func (b *Bucket) Stats() BucketStats {
+	var s, subStats BucketStats
+	pageSize := b.tx.db.pageSize
+
+	s.BucketN++
+	if b.root == 0 {
+		s.InlineBucketN++
+	}
+
+	b.forEachPage(func(p *page, depth int) {
+		if (p.flags & leafPageFlag) != 0 {
+			s.KeyN += int(p.count)
+
+			// used totals the used bytes for the page
+			used := pageHeaderSize
+
+			if p.count != 0 {
+				// If page has any elements, add all element headers.
+				used += leafPageElementSize * int(p.count-1)
+
+				// Add all element key, value sizes.
+				// The computation takes advantage of the fact that the position
+				// of the last element's key/value equals to the total of the sizes
+				// of all previous elements' keys and values.
+				// It also includes the last element's header.
+				lastElement := p.leafPageElement(p.count - 1)
+				used += int(lastElement.pos + lastElement.ksize + lastElement.vsize)
+			}
+
+			if b.root == 0 {
+				// For inline bucket just update the inline stats
+				s.InlineBUcketInuse += used
+			} else {
+				// For non-inlined bucket update all the leaf stats
+				s.LeafPageN++
+				s.LeafInuse += used
+				s.LeafOverflowN += int(p.overflow)
+
+				// Collect stats from sub-buckets.
+				// Do that by iterating over all element headers
+				// looking for the onces with bucketLeafFlag.
+				for i := uint16(0); i < p.count; i++ {
+					e := p.leafPageElement(i)
+					if (e.flags & bucketLeafFlag) != 0 {
+						// For any bucket element, open the element value
+						// and recursively call Stats on the contained bucket.
+						subStats.Add(b.openBucket(e.value()).Stats())
+					}
+				}
+			}
+
+		} else if (p.flags & branchPageFlag) != 0 {
+			s.BranchPageN++
+			lastElement := p.branchPageElement(p.count - 1)
+
+			// used totals the used bytes for the page
+			// Add header and all element headers.
+			used := pageHeaderSize + (branchPageElementSize * int(p.count-1))
+
+			// Add size of all keys and values.
+			// Again, use the fact that last element's position equals to
+			// the total of key, value sizes of all previous elements.
+			used += int(lastElement.pos + lastElement.ksize)
+			s.BranchInuse += used
+			s.BranchOverflowN += int(p.overflow)
+		}
+
+		// Keep track of maximum page depth.
+		if depth+1 > s.Depth {
+			s.Depth = depth + 1
+		}
+	})
+
+	// Alloc stats can be computed from page counts and pageSize.
+	s.BranchAlloc = (s.BranchPageN + s.BranchOverflowN) * pageSize
+	s.LeafAlloc = (s.LeafPageN + s.LeafOverflowN) * pageSize
+
+	// Add the max depth of sub-buckets to get total nested depth.
+	s.Depth += subStats.Depth
+	// Add the stats for all sub-buckets
+	s.Add(subStats)
+
+	return s
+}
+
 // ForEach executes a function for each key/value pair in a bucket.
 // If the provided function returns an error then the iteration is stopped
 // and the error is returned to the caller.
@@ -462,35 +536,67 @@ func (b *Bucket) _forEachPageNode(pgid pgid, depth int, fn func(*page, *node, in
 	}
 }
 
-// node creates a node from a page and associates it with a given parent.
-func (b *Bucket) node(pgid pgid, parent *node) *node {
-	_assert(b.nodes != nil, "nodes map expected")
+// spill writes all the nodes for this bucket to dirty pages.
+func (b *Bucket) spill() error {
+	// Spill all child buckets first
+	for name, child := range b.buckets {
+		// If the child bucket is small enough and it has no child buckets then
+		// write it inline into the parent bucket's page.
+		// Otherwise spill it like a normal bucket and make the parent value a
+		// pointer to the page
+		var value []byte
+		if child.inlineable() {
+			child.free()
+			value = child.write()
+		} else {
+			if err := child.spill(); err != nil {
+				return err
+			}
 
-	// Retrieve node if it's already been created.
-	if n := b.nodes[pgid]; n != nil {
-		return n
+			// Update the child bucket header in this bucket.
+			value = make([]byte, unsafe.Sizeof(bucket{}))
+			var bucket = (*bucket)(unsafe.Pointer(&value[0]))
+			*bucket = *child.bucket
+		}
+
+		// Skip writing the bucket if there are no materialized nodes.
+		if child.rootNode == nil {
+			continue
+		}
+
+		// Update parent node.
+		var c = b.Cursor()
+		k, _, flags := c.seek([]byte(name))
+		if !bytes.Equal([]byte(name), k) {
+			panic(fmt.Sprintf("misplaced bucket header: %x -> %x",
+				[]byte(name), k))
+		}
+		if flags&bucketLeafFlag == 0 {
+			panic(fmt.Sprintf("unexpected bucket header flag: %x", flags))
+		}
+
+		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
 	}
 
-	// Otherwise create a node and cache it.
-	n := &node{bucket: b, parent: parent}
-	if parent == nil {
-		b.rootNode = n
-	} else {
-		parent.children = append(parent.children, n)
+	// Ignore if there's not a materialized root node.
+	if b.rootNode == nil {
+		return nil
 	}
 
-	// Use the inline page if this is an inline bucket.
-	var p = b.page
-	if p == nil {
-		p = b.tx.page(pgid)
+	// Spill nodes.
+	if err := b.rootNode.spill(); err != nil {
+		return err
+	}
+	b.rootNode = b.rootNode.root()
+
+	// Update the root node for this bucket.
+	if b.rootNode.pgid >= b.tx.meta.pgid {
+		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)",
+			b.rootNode.pgid, b.tx.meta.pgid))
 	}
 
-	n.read(p)
-	b.nodes[pgid] = n
-
-	b.tx.stats.NodeCount++
-
-	return n
+	b.root = b.rootNode.pgid
+	return nil
 }
 
 // inlineable returns true if a bucket is small enough to be written inline
@@ -525,6 +631,65 @@ func (b *Bucket) maxInlineBucketSize() int {
 	return b.tx.db.pageSize / 4
 }
 
+// write allocates and writes a bucket to a byte slice
+func (b *Bucket) write() []byte {
+	// Allocate the appropriate size.
+	var n = b.rootNode
+	var value = make([]byte, bucketHeaderSize+n.size())
+
+	// Write a bucket header.
+	var bucket = (*bucket)(unsafe.Pointer(&value[0]))
+	*bucket = *b.bucket
+
+	// Convert byte slice to a fake page and write the root node.
+	var p = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
+	n.write(p)
+
+	return value
+}
+
+// rebalance attempts to balance all nodes.
+func (b *Bucket) rebalance() {
+	for _, n := range b.nodes {
+		n.rebalance()
+	}
+
+	for _, child := range b.buckets {
+		child.rebalance()
+	}
+}
+
+// node creates a node from a page and associates it with a given parent.
+func (b *Bucket) node(pgid pgid, parent *node) *node {
+	_assert(b.nodes != nil, "nodes map expected")
+
+	// Retrieve node if it's already been created.
+	if n := b.nodes[pgid]; n != nil {
+		return n
+	}
+
+	// Otherwise create a node and cache it.
+	n := &node{bucket: b, parent: parent}
+	if parent == nil {
+		b.rootNode = n
+	} else {
+		parent.children = append(parent.children, n)
+	}
+
+	// Use the inline page if this is an inline bucket.
+	var p = b.page
+	if p == nil {
+		p = b.tx.page(pgid)
+	}
+
+	n.read(p)
+	b.nodes[pgid] = n
+
+	b.tx.stats.NodeCount++
+
+	return n
+}
+
 // free recursively frees all pages in the bucket.
 func (b *Bucket) free() {
 	if b.root == 0 {
@@ -540,6 +705,17 @@ func (b *Bucket) free() {
 		}
 	})
 	b.root = 0
+}
+
+// dereference removes all references to the old mmap.
+func (b *Bucket) dereference() {
+	if b.rootNode != nil {
+		b.rootNode.root().dereference()
+	}
+
+	for _, child := range b.buckets {
+		child.dereference()
+	}
 }
 
 // pageNode returns the in-memory node, if it exists.
@@ -567,4 +743,56 @@ func (b *Bucket) pageNode(id pgid) (*page, *node) {
 
 	// Finally lookup the page from the transaction if no node is materialized
 	return b.tx.page(id), nil
+}
+
+// BucketStats records statistics about resources used by a bucket.
+type BucketStats struct {
+	// Page count statistics.
+	BranchPageN     int // number of logical branch pages
+	BranchOverflowN int // number of physical branch overflow pages
+	LeafPageN       int // number of logical leaf pages
+	LeafOverflowN   int // number of physical leaf overflow pages
+
+	// Tree statistics.
+	KeyN  int // number of keys/value pairs
+	Depth int // number of levels in B+tree
+
+	// Page size utilization.
+	BranchAlloc int // bytes allocated for physical branch pages
+	BranchInuse int // bytes actually used for branch data
+	LeafAlloc   int // bytes allocated for physical leaf pages
+	LeafInuse   int // bytes actually used for leaf data
+
+	// Bucket statistics
+	BucketN           int // total number of buckets including the top bucket
+	InlineBucketN     int // total number on inlined buckets
+	InlineBUcketInuse int // bytes used for inlined buckets (also accounted for in LeafInuse)
+}
+
+// Add merge bucket stats
+func (s *BucketStats) Add(other BucketStats) {
+	s.BranchPageN += other.BranchPageN
+	s.BranchOverflowN += other.BranchOverflowN
+	s.LeafPageN += other.LeafPageN
+	s.LeafOverflowN += other.LeafOverflowN
+	s.KeyN += other.KeyN
+
+	if s.Depth < other.Depth {
+		s.Depth = other.Depth
+	}
+	s.BranchAlloc += other.BranchAlloc
+	s.BranchInuse += other.BranchInuse
+	s.LeafAlloc += other.LeafAlloc
+	s.LeafInuse += other.LeafInuse
+
+	s.BucketN += other.BucketN
+	s.InlineBucketN += other.InlineBucketN
+	s.InlineBUcketInuse += other.InlineBUcketInuse
+}
+
+// cloneBytes returns a copy of a given slice
+func cloneBytes(v []byte) []byte {
+	var clone = make([]byte, len(v))
+	copy(clone, v)
+	return clone
 }
