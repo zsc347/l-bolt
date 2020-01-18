@@ -2,6 +2,25 @@ package bolt
 
 import "errors"
 
+// These errors can be returned when opening or calling methods on a DB.
+var (
+	// ErrInvalid is returned when both meta pages on a database are invalid.
+	// This typically occurs when a file is not a bolt database.
+	ErrInvalid = errors.New("invalid database")
+
+	// ErrVersionMismatch is returned when the data file was created with
+	// a different version of Bolt.
+	ErrorVersionMismatch = errors.New("version mismatch")
+
+	// ErrChecksum is returned when either meta page checksum does not match
+	// or when checksum is 0
+	ErrChecksum = errors.New("checksum error")
+
+	// ErrTimeout is returned when a database cannot obtain an exclusive lock
+	// on the data file after the timeout passed to Open().
+	ErrTimeout = errors.New("timeout")
+)
+
 // These errors can occur when beginning or committing a Tx
 var (
 	// ErrTxNotWritable is returned when performing a write
